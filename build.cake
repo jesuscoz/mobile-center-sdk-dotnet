@@ -41,6 +41,9 @@ class MobileCenterModule {
 	}
 }
 
+// Azure storage container name
+const string AZURE_STORAGE_CONTAINER_NAME = "sdk";
+
 // Prefix for temporary intermediates that are created by this script
 var TEMPORARY_PREFIX = "CAKE_SCRIPT_TEMP";
 
@@ -387,8 +390,8 @@ Task("UploadAssemblies")
 	.Does(()=>
 {
 	// The environment variables below must be set for this task to succeed
-	var apiKey = EnvironmentVariable("AZURE_STORAGE_ACCESS_KEY");
-	var accountName = EnvironmentVariable("AZURE_STORAGE_ACCOUNT");
+	var apiKey = GetAzureStorageAccessKey();
+	var accountName = GetAzureStorageAccount();
 
 	foreach (var assemblyGroup in PLATFORM_PATHS.UploadAssemblyGroups)
 	{
@@ -402,7 +405,7 @@ Task("UploadAssemblies")
 	AzureStorage.UploadFileToBlob(new AzureStorageSettings
 	{
 		AccountName = accountName,
-		ContainerName = "sdk",
+		ContainerName = AZURE_STORAGE_CONTAINER_NAME,
 		BlobName = PLATFORM_PATHS.UploadAssembliesZip,
 		Key = apiKey,
 		UseHttps = true
@@ -416,9 +419,10 @@ Task("UploadCertificates")
 	.Does(()=>
 {
 	// The environment variables below must be set for this task to succeed
-	var apiKey = EnvironmentVariable("AZURE_STORAGE_ACCESS_KEY");
-	var accountName = EnvironmentVariable("AZURE_STORAGE_ACCOUNT");
-	Information(accountName);
+	var apiKey = GetAzureStorageAccessKey();
+	var accountName = GetAzureStorageAccount();
+
+	Information("Uploading certificates to blob storage.");
 	CleanDirectory(CERTIFICATE_FOLDER);
 	CopyFiles(CERTIFICATE_PATHS, CERTIFICATE_FOLDER);
 	Zip(CERTIFICATE_FOLDER, CERTIFICATE_ZIP);
@@ -426,19 +430,20 @@ Task("UploadCertificates")
 	AzureStorage.UploadFileToBlob(new AzureStorageSettings
 	{
 		AccountName = accountName,
-		ContainerName = "sdk",
+		ContainerName = AZURE_STORAGE_CONTAINER_NAME,
 		BlobName = ENCRYPTED_CERTIFICATE_ZIP,
 		Key = apiKey,
 		UseHttps = true
 	}, ENCRYPTED_CERTIFICATE_ZIP);
 
+	Information("Successfully uploaded certificates to blob storage.");
 }).OnError(HandleError).Finally(()=>RunTarget("RemoveTemporaries"));
 
 // Download app certificates from Azure storage and copy them to the correct locations
 Task("DownloadCertificates")
 	.Does(()=>
 {
-	Information("Fetching assemblies from url: " + CERTIFICATES_URL);
+	Information("Fetching certificates from url: " + CERTIFICATES_URL);
 	CleanDirectory(CERTIFICATE_FOLDER);
 	DownloadFile(CERTIFICATES_URL, ENCRYPTED_CERTIFICATE_ZIP);
 	DecryptFile(ENCRYPTED_CERTIFICATE_ZIP, CERTIFICATE_ZIP);
@@ -554,15 +559,15 @@ Task("RestoreTestPackages").Does(() =>
 // Remove any uploaded nugets from azure storage
 Task("CleanAzureStorage").Does(()=>
 {
-	var apiKey = EnvironmentVariable("AZURE_STORAGE_ACCESS_KEY");
-	var accountName = EnvironmentVariable("AZURE_STORAGE_ACCOUNT");
+	var apiKey = GetAzureStorageAccessKey();
+	var accountName = GetAzureStorageAccount();
 
 	try
 	{
 		AzureStorage.DeleteBlob(new AzureStorageSettings
 		{
 			AccountName = accountName,
-			ContainerName = "sdk",
+			ContainerName = AZURE_STORAGE_CONTAINER_NAME,
 			BlobName = MAC_ASSEMBLIES_ZIP + STORAGE_ID,
 			Key = apiKey,
 			UseHttps = true
@@ -571,7 +576,7 @@ Task("CleanAzureStorage").Does(()=>
 		AzureStorage.DeleteBlob(new AzureStorageSettings
 		{
 			AccountName = accountName,
-			ContainerName = "sdk",
+			ContainerName = AZURE_STORAGE_CONTAINER_NAME,
 			BlobName = WINDOWS_ASSEMBLIES_ZIP + STORAGE_ID,
 			Key = apiKey,
 			UseHttps = true
@@ -580,7 +585,7 @@ Task("CleanAzureStorage").Does(()=>
 		AzureStorage.DeleteBlob(new AzureStorageSettings
 		{
 			AccountName = accountName,
-			ContainerName = "sdk",
+			ContainerName = AZURE_STORAGE_CONTAINER_NAME,
 			BlobName = ENCRYPTED_CERTIFICATE_ZIP,
 			Key = apiKey,
 			UseHttps = true
@@ -648,23 +653,22 @@ Task("NugetPackVSTS").Does(()=>
 	}
 }).OnError(HandleError);
 
-
+// Encrypts a file with AES using a given 16 byte key and IV
 void EncryptFile(string filename, string outfilename)
 {
 	Information("Encrypting file '" + filename + "' to file '" + outfilename + "'");
-	var key =  System.Text.Encoding.UTF8.GetBytes(EnvironmentVariable("MOBILE_CENTER_CERTIFICATE_AES_KEY"));
-	var iv = System.Text.Encoding.UTF8.GetBytes(EnvironmentVariable("MOBILE_CENTER_CERTIFICATE_IV"));
 
-	// Adapted from: https://msdn.microsoft.com/en-us/library/system.security.cryptography.aes(v=vs.110).aspx
+	// The following is adapted from: https://msdn.microsoft.com/en-us/library/system.security.cryptography.aes(v=vs.110).aspx
 	// and https://stackoverflow.com/questions/604210/padding-is-invalid-and-cannot-be-removed-using-aesmanaged
 
+	// Declare array that will contain the encrypted file data
  	byte[] encrypted;
 
-    // Create an Aes object  with the specified key and IV.
+    // Create an Aes object with the stored/given key and IV.
 	using (Aes aesAlg = Aes.Create())
     {
-		aesAlg.Key = key;
-        aesAlg.IV = iv;
+		aesAlg.Key = GetCertificateAESKey();
+        aesAlg.IV =  GetCertificateIV();
 
         // Create an encrytor to perform the stream transform.
 		ICryptoTransform encryptor = aesAlg.CreateEncryptor(aesAlg.Key, aesAlg.IV);
@@ -674,8 +678,10 @@ void EncryptFile(string filename, string outfilename)
 		{
     		using (CryptoStream csEncrypt = new CryptoStream(msEncrypt, encryptor, CryptoStreamMode.Write))
 			{
+				// Read the input file as bytes
 				var cleartext = System.IO.File.ReadAllBytes(filename);
-            	//Write all data to the stream.
+
+            	//Write all data to the stream (this is the encryption step)
             	csEncrypt.Write(cleartext, 0, cleartext.Length);
         	}
             encrypted = msEncrypt.ToArray();
@@ -685,42 +691,63 @@ void EncryptFile(string filename, string outfilename)
 	Information("Encryption successful.");
 }
 
+// Decrypts a file with AES using a given 16 byte key and IV
 void DecryptFile(string filename, string outfilename)
 {
 	Information("Decrypting file '" + filename + "' to file '" + outfilename + "'");
 
-	var key =  System.Text.Encoding.UTF8.GetBytes(EnvironmentVariable("MOBILE_CENTER_CERTIFICATE_AES_KEY"));
-	var iv = System.Text.Encoding.UTF8.GetBytes(EnvironmentVariable("MOBILE_CENTER_CERTIFICATE_IV"));
-
-	// Adapted from: https://msdn.microsoft.com/en-us/library/system.security.cryptography.aes(v=vs.110).aspx
+	// The following is adapted from: https://msdn.microsoft.com/en-us/library/system.security.cryptography.aes(v=vs.110).aspx
 	// and https://stackoverflow.com/questions/604210/padding-is-invalid-and-cannot-be-removed-using-aesmanaged
 
-    // Create an Aes object
-    // with the specified key and IV.
+    // Create an Aes object with the stored/given key and IV.
 	using (Aes aesAlg = Aes.Create())
     {
-        aesAlg.Key = key;
-        aesAlg.IV = iv;
+        aesAlg.Key = GetCertificateAESKey();
+        aesAlg.IV = GetCertificateIV();
                 
 		// Create a decrytor to perform the stream transform.
         ICryptoTransform decryptor = aesAlg.CreateDecryptor(aesAlg.Key, aesAlg.IV);
+
+		// Read the encrypted file into memory
 		var cipherText = System.IO.File.ReadAllBytes(filename);
+		
         // Create the streams used for decryption.
         using (MemoryStream msDecrypt = new MemoryStream(cipherText))
 		{
         	using (CryptoStream csDecrypt = new CryptoStream(msDecrypt, decryptor, CryptoStreamMode.Write))
 			{
+				// Perform the actual decryption by writing the cipher text to the stream
 				csDecrypt.Write(cipherText, 0, cipherText.Length);	
 			}
 			
+            // Read the decrypted bytes from the decrypting stream and write them to the output file
 			var cleartext = msDecrypt.ToArray();
-
-            // Read the decrypted bytes from the decrypting stream
-            // and place them in a string.
             System.IO.File.WriteAllBytes(outfilename, cleartext);
 		}
     }
 	Information("Decryption successful.");
+}
+
+byte[] GetCertificateAESKey()
+{
+	var keyString = Argument("CertificateAesKey", EnvironmentVariable("MOBILE_CENTER_CERTIFICATE_AES_KEY"));
+	return System.Text.Encoding.UTF8.GetBytes(keyString);
+}
+
+byte[] GetCertificateIV()
+{
+	var ivString = Argument("CertificateAesIV", EnvironmentVariable("MOBILE_CENTER_CERTIFICATE_IV"));
+	return System.Text.Encoding.UTF8.GetBytes(ivString);
+}
+
+string GetAzureStorageAccessKey()
+{
+	return Argument("AzureStorageAccessKey", EnvironmentVariable("AZURE_STORAGE_ACCESS_KEY"));
+}
+
+string GetAzureStorageAccount()
+{
+	return Argument("AzureStorageAccountName", EnvironmentVariable("AZURE_STORAGE_ACCOUNT"));
 }
 
 // Copy files to a clean directory using string names instead of FilePath[] and DirectoryPath

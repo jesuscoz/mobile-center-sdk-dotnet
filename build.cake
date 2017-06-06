@@ -7,6 +7,8 @@
 using System.Net;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.IO;
+using System.Security.Cryptography;
 
 // MobileCenter module class definition.
 class MobileCenterModule {
@@ -81,6 +83,15 @@ var MOBILECENTER_MODULES = new [] {
 	new MobileCenterModule("mobile-center-distribute-release.aar", "MobileCenterDistribute.framework.zip", "SDK/MobileCenterDistribute/Microsoft.Azure.Mobile.Distribute", "MobileCenterDistribute.nuspec"),
 	new MobileCenterModule("mobile-center-push-release.aar", "MobileCenterPush.framework.zip", "SDK/MobileCenterPush/Microsoft.Azure.Mobile.Push", "MobileCenterPush.nuspec")	
 };
+
+// Certificate folder
+var CERTIFICATE_FOLDER = TEMPORARY_PREFIX + "MobileCenterCertificates";
+
+// Certificate paths
+string[] CERTIFICATE_PATHS = {"Tests/Microsoft.Azure.Mobile.Test.UWP/Microsoft.Azure.Mobile.Test.UWP_TemporaryKey.pfx"};
+var CERTIFICATE_ZIP = TEMPORARY_PREFIX + "MobileCenterCertificates.zip";
+var ENCRYPTED_CERTIFICATE_ZIP = TEMPORARY_PREFIX + "MobileCenterCertificatesEncrypted";
+var CERTIFICATES_URL = SDK_STORAGE_URL + ENCRYPTED_CERTIFICATE_ZIP;
 
 // Task TARGET for build
 var TARGET = Argument("target", Argument("t", "Default"));
@@ -399,6 +410,50 @@ Task("UploadAssemblies")
 
 }).OnError(HandleError).Finally(()=>RunTarget("RemoveTemporaries"));
 
+
+// Upload app certificates to Azure storage
+Task("UploadCertificates")
+	.Does(()=>
+{
+	// The environment variables below must be set for this task to succeed
+	var apiKey = EnvironmentVariable("AZURE_STORAGE_ACCESS_KEY");
+	var accountName = EnvironmentVariable("AZURE_STORAGE_ACCOUNT");
+	Information(accountName);
+	CleanDirectory(CERTIFICATE_FOLDER);
+	CopyFiles(CERTIFICATE_PATHS, CERTIFICATE_FOLDER);
+	Zip(CERTIFICATE_FOLDER, CERTIFICATE_ZIP);
+	EncryptFile(CERTIFICATE_ZIP, ENCRYPTED_CERTIFICATE_ZIP);
+	AzureStorage.UploadFileToBlob(new AzureStorageSettings
+	{
+		AccountName = accountName,
+		ContainerName = "sdk",
+		BlobName = ENCRYPTED_CERTIFICATE_ZIP,
+		Key = apiKey,
+		UseHttps = true
+	}, ENCRYPTED_CERTIFICATE_ZIP);
+
+}).OnError(HandleError).Finally(()=>RunTarget("RemoveTemporaries"));
+
+// Download app certificates from Azure storage and copy them to the correct locations
+Task("DownloadCertificates")
+	.Does(()=>
+{
+	Information("Fetching assemblies from url: " + CERTIFICATES_URL);
+	CleanDirectory(CERTIFICATE_FOLDER);
+	DownloadFile(CERTIFICATES_URL, ENCRYPTED_CERTIFICATE_ZIP);
+	DecryptFile(ENCRYPTED_CERTIFICATE_ZIP, CERTIFICATE_ZIP);
+	Unzip(CERTIFICATE_ZIP, CERTIFICATE_FOLDER);
+	DeleteFiles(ENCRYPTED_CERTIFICATE_ZIP);
+	Information("Successfully downloaded certificates.");
+	foreach (var path in CERTIFICATE_PATHS)
+	{
+ 		var certFilename = System.IO.Path.GetFileName(path);
+		Information("Copying certificate '" + CERTIFICATE_FOLDER + "/" + certFilename + "' to '" + path + "'");
+		CopyFile(CERTIFICATE_FOLDER + "/" + certFilename, path);
+	}
+}).OnError(HandleError);
+
+
 // Download assemblies from azure storage
 Task("DownloadAssemblies").Does(()=>
 {
@@ -521,6 +576,15 @@ Task("CleanAzureStorage").Does(()=>
 			Key = apiKey,
 			UseHttps = true
 		});
+		
+		AzureStorage.DeleteBlob(new AzureStorageSettings
+		{
+			AccountName = accountName,
+			ContainerName = "sdk",
+			BlobName = ENCRYPTED_CERTIFICATE_ZIP,
+			Key = apiKey,
+			UseHttps = true
+		});
 	}
 	catch
 	{
@@ -584,6 +648,81 @@ Task("NugetPackVSTS").Does(()=>
 	}
 }).OnError(HandleError);
 
+
+void EncryptFile(string filename, string outfilename)
+{
+	Information("Encrypting file '" + filename + "' to file '" + outfilename + "'");
+	var key =  System.Text.Encoding.UTF8.GetBytes(EnvironmentVariable("MOBILE_CENTER_CERTIFICATE_AES_KEY"));
+	var iv = System.Text.Encoding.UTF8.GetBytes(EnvironmentVariable("MOBILE_CENTER_CERTIFICATE_IV"));
+
+	// Adapted from: https://msdn.microsoft.com/en-us/library/system.security.cryptography.aes(v=vs.110).aspx
+	// and https://stackoverflow.com/questions/604210/padding-is-invalid-and-cannot-be-removed-using-aesmanaged
+
+ 	byte[] encrypted;
+
+    // Create an Aes object  with the specified key and IV.
+	using (Aes aesAlg = Aes.Create())
+    {
+		aesAlg.Key = key;
+        aesAlg.IV = iv;
+
+        // Create an encrytor to perform the stream transform.
+		ICryptoTransform encryptor = aesAlg.CreateEncryptor(aesAlg.Key, aesAlg.IV);
+
+        // Create the streams used for encryption.
+        using (MemoryStream msEncrypt = new MemoryStream())
+		{
+    		using (CryptoStream csEncrypt = new CryptoStream(msEncrypt, encryptor, CryptoStreamMode.Write))
+			{
+				var cleartext = System.IO.File.ReadAllBytes(filename);
+            	//Write all data to the stream.
+            	csEncrypt.Write(cleartext, 0, cleartext.Length);
+        	}
+            encrypted = msEncrypt.ToArray();
+		}
+    }
+	System.IO.File.WriteAllBytes(outfilename, encrypted);
+	Information("Encryption successful.");
+}
+
+void DecryptFile(string filename, string outfilename)
+{
+	Information("Decrypting file '" + filename + "' to file '" + outfilename + "'");
+
+	var key =  System.Text.Encoding.UTF8.GetBytes(EnvironmentVariable("MOBILE_CENTER_CERTIFICATE_AES_KEY"));
+	var iv = System.Text.Encoding.UTF8.GetBytes(EnvironmentVariable("MOBILE_CENTER_CERTIFICATE_IV"));
+
+	// Adapted from: https://msdn.microsoft.com/en-us/library/system.security.cryptography.aes(v=vs.110).aspx
+	// and https://stackoverflow.com/questions/604210/padding-is-invalid-and-cannot-be-removed-using-aesmanaged
+
+    // Create an Aes object
+    // with the specified key and IV.
+	using (Aes aesAlg = Aes.Create())
+    {
+        aesAlg.Key = key;
+        aesAlg.IV = iv;
+                
+		// Create a decrytor to perform the stream transform.
+        ICryptoTransform decryptor = aesAlg.CreateDecryptor(aesAlg.Key, aesAlg.IV);
+		var cipherText = System.IO.File.ReadAllBytes(filename);
+        // Create the streams used for decryption.
+        using (MemoryStream msDecrypt = new MemoryStream(cipherText))
+		{
+        	using (CryptoStream csDecrypt = new CryptoStream(msDecrypt, decryptor, CryptoStreamMode.Write))
+			{
+				csDecrypt.Write(cipherText, 0, cipherText.Length);	
+			}
+			
+			var cleartext = msDecrypt.ToArray();
+
+            // Read the decrypted bytes from the decrypting stream
+            // and place them in a string.
+            System.IO.File.WriteAllBytes(outfilename, cleartext);
+		}
+    }
+	Information("Decryption successful.");
+}
+
 // Copy files to a clean directory using string names instead of FilePath[] and DirectoryPath
 void CopyFiles(IEnumerable<string> files, string targetDirectory, bool clean = true)
 {
@@ -613,6 +752,7 @@ void CleanDirectory(string directoryName)
 
 void HandleError(Exception exception)
 {
+	Error("Encountered error: " + exception.Message);
 	RunTarget("clean");
 	throw exception;
 }
